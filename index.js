@@ -1,142 +1,195 @@
 var remap = require('./remap.js').remap;
+var Immutable = require('immutable');
 
 module.exports = function (params) {
 	return new params.Plugin("babel-plugin", {
 		visitor: {
 			CallExpression: function (node, parent, scope) {
 				var t = params.types;
-				if (t.isMemberExpression(node.callee) &&
-					node.callee.object.name == '_' && node.callee.property.name == 'forEach')
-				{
-					var indexVar = scope.generateUidIdentifier("i");
-					var arrayLengthVar = scope.generateUidIdentifier("l");
-					var arrayTempStoreVar = scope.generateUidIdentifier("arrVar");
-					var callbackTempStoreVar = scope.generateUidIdentifier("callback");
-					var callbackFunctionNode = node.arguments[1];
-					var includeIndex = false;
-					var includeValue = false;
-					var customContext = node.arguments[2];
-					var vars = [];
+				var genId = scope.generateUidIdentifier.bind(scope);
 
-					function getValueExpression()
+				function getArrayForLoopReplacement(loopBody, indexVar, arrayTempStoreVar)
+				{
+					var arrayLengthVar = genId("l");
+
+					return t.forStatement(
+						t.variableDeclaration(
+							'let',
+							[
+								t.assignmentExpression(
+									'=',
+									indexVar,
+									t.Literal(0)
+								),
+								t.assignmentExpression(
+									'=',
+									arrayLengthVar,
+									t.MemberExpression(
+										arrayTempStoreVar,
+										t.Identifier('length')
+									)
+								)
+							]
+						),
+						t.LogicalExpression('<', indexVar, arrayLengthVar),
+						t.UnaryExpression('++', indexVar),
+						loopBody
+					);
+				}
+
+				function getObjectForInLoopReplacement(loopBody, indexVar, arrayTempStoreVar)
+				{
+					return	t.forInStatement(
+						t.variableDeclaration(
+							'let',
+							[
+								indexVar
+							]
+						),
+						arrayTempStoreVar,
+						loopBody
+					);
+				}
+
+				function getFunctionExpressionLoopBody(loopNode, indexVar, arrayTempStoreVar)
+				{
+					var functionExprNode = loopNode.arguments[1];
+					var loopBodyNode = functionExprNode.body.__clone();
+
+					var valueArgumentUsed = !!functionExprNode.params[0];
+					if (valueArgumentUsed)
 					{
-						return t.MemberExpression(
-							arrayTempStoreVar,
-							indexVar,
-							true
-						);
+						loopBodyNode.body.unshift(t.variableDeclaration(
+							'let',
+							[
+								t.assignmentExpression(
+									'=',
+									functionExprNode.params[0],
+									getMemberExpression(indexVar, arrayTempStoreVar)
+								)
+							]
+						));
 					}
 
-					if (t.isFunctionExpression(callbackFunctionNode))
+					var indexArgumentUsed = !!functionExprNode.params[1];
+					if (indexArgumentUsed)
 					{
-						var functionBodyClone = callbackFunctionNode.body.__clone();
+						loopBodyNode.body.unshift(t.variableDeclaration(
+							'let',
+							[
+								t.assignmentExpression(
+									'=',
+									functionExprNode.params[1],
+									indexVar
+								)
+							]
+						));
+					}
 
-						var includeValue = !!callbackFunctionNode.params[0];
-						if (includeValue)
-						{
-							functionBodyClone.body.unshift(t.variableDeclaration(
-								'let',
-								[
-									t.assignmentExpression(
-										'=',
-										callbackFunctionNode.params[0],
-										getValueExpression()
-									)
-								]
-							));
-						}
+					var customContext = loopNode.arguments[2];
+					if (customContext)
+					{
+						loopBodyNode.shadow = true;
+						loopBodyNode.shadowMap = loopBodyNode.shadowMap || {};
+						loopBodyNode.shadowMap['this'] = customContext;
+					}
 
-						var includeIndex = !!callbackFunctionNode.params[1];
-						if (includeIndex)
-						{
-							functionBodyClone.body.unshift(t.variableDeclaration(
-								'let',
-								[
-									t.assignmentExpression(
-										'=',
-										callbackFunctionNode.params[1],
-										indexVar
-									)
-								]
-							));
-						}
+					return loopBodyNode;
+				}
 
-						if (customContext)
-						{
-							functionBodyClone.shadow = true;
-							functionBodyClone.shadowMap = functionBodyClone.shadowMap || {};
-							functionBodyClone.shadowMap['this'] = customContext;
-						}
+				function getMemberExpressionLoopBody(loopNode, indexVar, arrayTempStoreVar, callbackTempStoreVar)
+				{
+					var loopBodyNode;
+					var customContext = loopNode.arguments[2];
+
+					if (customContext)
+					{
+						loopBodyNode = t.BlockStatement([
+							t.callExpression(
+								t.MemberExpression(
+									callbackTempStoreVar,
+									t.Identifier('call')
+								),
+								[customContext, getMemberExpression(indexVar, arrayTempStoreVar), indexVar]
+							)
+						]);
 					}
 					else
 					{
-						if (customContext)
-						{
-							var functionBodyClone = t.BlockStatement([
-								t.callExpression(
-									t.MemberExpression(
-										callbackTempStoreVar,
-										t.Identifier('call')
-									),
-									[customContext, getValueExpression(), indexVar]
-								)
-							]);
-						}
-						else
-						{
-							var functionBodyClone = t.BlockStatement([
-								t.callExpression(
-									callbackTempStoreVar,
-									[getValueExpression(), indexVar]
-								)
-							]);
-						}
-
-						vars.push(
-							t.assignmentExpression(
-								'=',
+						loopBodyNode = t.BlockStatement([
+							t.callExpression(
 								callbackTempStoreVar,
-								callbackFunctionNode
+								[getMemberExpression(indexVar, arrayTempStoreVar), indexVar]
 							)
-						);
+						]);
 					}
 
-					vars.push(
-						t.assignmentExpression(
-							'=',
-							arrayTempStoreVar,
-							node.arguments[0]
-						)
-					);
+					return loopBodyNode;
+				};
+
+				function isArrayLoop(calleeNode)
+				{
+					return isLoopFor('forEachItem', calleeNode);
+				}
+
+				function isObjectLoop(calleeNode)
+				{
+					return isLoopFor('forEachProp', calleeNode);
+				}
+
+				function isLoopFor(iterType, calleeNode)
+				{
+					return calleeNode.property.name == iterType;
+				}
+
+				function addVarInit(vars, varName, value)
+				{
+					return vars.push(t.assignmentExpression('=', varName, value));
+				};
+
+				function getMemberExpression(key, object)
+				{
+					return t.MemberExpression(object, key, true);
+				}
+
+				if (t.isMemberExpression(node.callee) && node.callee.object.name == '_' &&
+					(isArrayLoop(node.callee) || isObjectLoop(node.callee)))
+				{
+					var indexId = genId("i");
+					var arrayId = genId("arrVar");
+					var callbackId = genId("callback");
+					var loopBodyNode;
+					var callbackNode = node.arguments[1];
+					var outerVars = Immutable.List();
+
+					if (t.isFunctionExpression(callbackNode))
+					{
+						loopBodyNode = getFunctionExpressionLoopBody(node, indexId, arrayId);
+					}
+					else
+					{
+						loopBodyNode = getMemberExpressionLoopBody(node, indexId, arrayId, callbackId);
+						outerVars = addVarInit(outerVars, callbackId, callbackNode);
+					}
+
+					outerVars = addVarInit(outerVars, arrayId, node.arguments[0]);
+
+					var replacement;
+					if (isArrayLoop(node.callee))
+					{
+						replacement = getArrayForLoopReplacement(loopBodyNode, indexId, arrayId);
+					}
+					else
+					{
+						replacement = getObjectForInLoopReplacement(loopBodyNode, indexId, arrayId);
+					}
 
 					this.replaceWithMultiple([
 						t.variableDeclaration(
 							'let',
-							vars
+							outerVars.toArray()
 						),
-						t.forStatement(
-							t.variableDeclaration(
-								'let',
-								[
-									t.assignmentExpression(
-										'=',
-										indexVar,
-										t.Literal(0)
-									),
-									t.assignmentExpression(
-										'=',
-										arrayLengthVar,
-										t.MemberExpression(
-											arrayTempStoreVar,
-											t.Identifier('length')
-										)
-									)
-								]
-							),
-							t.LogicalExpression('<', indexVar, arrayLengthVar),
-							t.UnaryExpression('++', indexVar),
-							functionBodyClone
-						)
+						replacement
 					]);
 				}
 			},
@@ -146,4 +199,4 @@ module.exports = function (params) {
 			}
 		}
 	});
-}
+};

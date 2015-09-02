@@ -1,9 +1,18 @@
 {
   "name": "babel-lodash-replace",
   "description": "Replace all lodash forEach calls with simple for () loops",
-  "author": { "name": "Michail Shipov", "email": "mshipov@yandex.ru" },
-  "files": ["index.js", "remap.js"],
+  "author": {
+    "name": "Michail Shipov",
+    "email": "mshipov@yandex.ru"
+  },
+  "files": [
+    "index.js",
+    "remap.js"
+  ],
   "license": "UNLICENSED",
   "repository": "https://github.com/SkReD/babel-plugin",
-  "version": "1.0.0"
+  "version": "1.0.0",
+  "dependencies": {
+    "immutable": "^3.7.4"
+  }
 }
